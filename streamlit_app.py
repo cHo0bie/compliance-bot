@@ -1,169 +1,144 @@
-# Streamlit Compliance Bot (GigaChat, RAG → Guardrails → Log)
-import os
-import re
-import csv
-import time
-import json
-import hashlib
-from typing import List, Dict, Tuple
 
+import os, io, json, textwrap
 import streamlit as st
-import pandas as pd
 
 from src.providers.gigachat import GigaChat
-from src.rag.tfidf import TfidfIndex, load_markdown_corpus
+from src.rag.hybrid import HybridIndex, read_text_from_file, chunk_text
+from src.guardrails.rules import detect_pii, load_policy, violates_policy
 
-# -----------------------------
-# Env / secrets
-# -----------------------------
-AUTH_KEY  = os.getenv("GIGACHAT_AUTH_KEY", "")
-SCOPE     = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
-MODEL     = os.getenv("GIGACHAT_MODEL", "GigaChat-Pro")
-VERIFY    = os.getenv("GIGACHAT_VERIFY", "true").lower() != "false"
-
-# Fixed provider (per your request)
-def get_chat() -> GigaChat:
-    return GigaChat(auth_key=AUTH_KEY, scope=SCOPE, model=MODEL, verify=VERIFY)
-
-# -----------------------------
-# Guardrails: simple but practical
-# -----------------------------
-PII_PATTERNS = [
-    (r"\b\d{16}\b", "Найден возможный номер карты"),
-    (r"\b\d{3}-\d{3}-\d{3} \d{2}\b", "Найден возможный ИНН/СНИЛС/ИНН-фрагмент"),
-    (r"\b\d{4}\s?\d{6}\b", "Найден возможный паспортный номер"),
-    (r"\b\d{11}\b", "Найден возможный телефон"),
-    (r"\b[А-Яа-яA-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "Найден возможный email"),
-]
-
-BANNED_TOPICS = [
-    "как обойти проверку личности",
-    "как обойти kyc",
-    "как обойти aml",
-    "как подделать документы",
-    "как скрыть источник средств",
-]
-
-def run_guardrails(prompt: str, llm_answer: str) -> Tuple[bool, List[str]]:
-    """Return (ok, messages)."""
-    violations = []
-    low = (prompt + " " + llm_answer).lower()
-
-    for pat, msg in PII_PATTERNS:
-        if re.search(pat, prompt) or re.search(pat, llm_answer):
-            violations.append(f"PII: {msg}")
-
-    for topic in BANNED_TOPICS:
-        if topic in low:
-            violations.append(f"Запрещённая тема: «{topic}»")
-
-    # LLM assert: должен быть раздел «Источники:» и хотя бы одна ссылка вида [1], [2], ...
-    if "источники" not in llm_answer.lower() or not re.search(r"\[\d+\]", llm_answer):
-        violations.append("ЛЛМ-ассерт: отсутствуют обязательные цитаты источников ([1], [2], …)")
-
-    return (len(violations) == 0, violations)
-
-# -----------------------------
-# Prompt templates
-# -----------------------------
-SYSTEM_PROMPT = """Ты — помощник комплаенс-офицера банка.
-Отвечай строго по фактам, кратко и в деловом стиле.
-Всегда **обязательно** добавляй раздел:
-«Источники: [1] file://...; [2] file://...». Номер соответствует позициям из контекста.
-Если нет релевантных фрагментов — честно напиши: «Не нашёлся ответ на ваш вопрос.».
-"""
-USER_PROMPT_TEMPLATE = """Вопрос пользователя: {question}
-
-Контекст (релевантные фрагменты из базы знаний):
-{context}
-
-Инструкция:
-1) Ответь по пунктам, опираясь **только** на контекст.
-2) В конце обязательно добавь раздел «Источники: [1] …; [2] …»,
-   где укажи номера и пути документов из контекста, которые ты использовал.
-"""
-
-# -----------------------------
-# Load corpus & build index
-# -----------------------------
-@st.cache_data(show_spinner=False)
-def cached_index() -> Tuple[TfidfIndex, List[Dict]]:
-    corpus = load_markdown_corpus("samples/knowledge")
-    index = TfidfIndex([c["content"] for c in corpus])
-    return index, corpus
-
-# -----------------------------
-# UI
-# -----------------------------
-st.set_page_config(page_title="Compliance Bot (GigaChat)", layout="wide")
-st.title("Demo: Комплаенс-бот")
-st.caption("RAG → LLM (GigaChat) → Guardrails → Log")
+# --- UI ---
+st.set_page_config(page_title="Compliance Bot Pro", layout="wide")
+st.title("Compliance Bot Pro — GigaChat (RAG + Guardrails + Judge)")
 
 with st.sidebar:
-    st.header("Провайдер и параметры")
-    st.selectbox("Провайдер", ["GigaChat"], index=0, disabled=True)
-    st.selectbox("Модель", [MODEL], index=0, disabled=True)
-    top_k = st.slider("Top-k пассажей", 1, 8, 4)
-    use_llm = st.toggle("Использовать LLM для финального ответа", True,
-                        help="Если отключить — покажем только найденные пассажи.")
-    st.divider()
-    st.subheader("Лог")
-    dl = st.session_state.get("log_rows", [])
-    if dl:
-        df = pd.DataFrame(dl)
-        st.download_button("Скачать лог (CSV)", df.to_csv(index=False).encode("utf-8"),
-                           file_name="compliance_log.csv", mime="text/csv")
+    st.header("Ингест и параметры")
+    alpha = st.slider("Вес TF-IDF (0 = только эмбеддинги)", 0.0, 1.0, 0.5, 0.05)
+    topk = st.slider("Top‑k пассажей", 1, 10, 5, 1)
+    uploaded = st.file_uploader("Добавить PDF/MD/TXT", type=["pdf","md","txt"], accept_multiple_files=True)
+    build = st.button("Переиндексировать")
+    export = st.button("Экспорт отчёта (Markdown)")
 
-question = st.text_input("Вопрос", "Можно ли открыть счёт нерезиденту и какие нужны документы?")
-col1, col2 = st.columns([1,3])
-with col1:
-    run_btn = st.button("Искать")
-with col2:
-    st.write("")
+# --- Data / Index ---
+if "index" not in st.session_state:
+    st.session_state.index = HybridIndex(alpha=alpha)
+    # preload samples
+    base = os.path.join(os.path.dirname(__file__), "samples", "knowledge")
+    docs = []
+    for fn in os.listdir(base):
+        p = os.path.join(base, fn)
+        text = read_text_from_file(p)
+        for i,ch in enumerate(chunk_text(text)):
+            docs.append({"id": f"{fn}-{i}", "title": fn, "text": ch, "source": f"file://{p}"})
+    st.session_state.index.add_docs(docs)
+    st.session_state.index.build()
+    st.session_state.history = []
 
-if run_btn:
-    index, corpus = cached_index()
-    docs = index.top_k(question, top_k=top_k)
-    st.subheader("Найденные пассажи")
-    ctx_lines = []
-    for i, (score, idx) in enumerate(docs, start=1):
-        meta = corpus[idx]
-        st.markdown(f"**[{i}] {meta['title']}** — `file://{meta['path']}`  \nрейтйнг: {score:.3f}")
-        st.write(meta["content"][:1000] + ("..." if len(meta["content"])>1000 else ""))
-        ctx_lines.append(f"[{i}] file://{meta['path']}\n{meta['content']}\n")
+# apply changed alpha
+st.session_state.index.alpha = alpha
 
-    if use_llm:
-        st.subheader("Ответ")
-        chat = get_chat()
-        ctx_str = "\n\n".join(ctx_lines)
-        prompt = USER_PROMPT_TEMPLATE.format(question=question, context=ctx_str)
-        try:
-            answer = chat.chat(
-                system=SYSTEM_PROMPT,
-                user=prompt,
-                temperature=0.2,
-                max_tokens=700
-            )
-        except Exception as e:
-            st.error(f"Ошибка обращения к GigaChat: {e}")
-            answer = "Не удалось получить ответ от модели."
+# handle uploads
+if uploaded:
+    new_docs = []
+    up_base = os.path.join(os.path.dirname(__file__), "uploaded")
+    os.makedirs(up_base, exist_ok=True)
+    for f in uploaded:
+        path = os.path.join(up_base, f.name)
+        with open(path, "wb") as out:
+            out.write(f.read())
+        txt = read_text_from_file(path)
+        for i,ch in enumerate(chunk_text(txt)):
+            new_docs.append({"id": f"{f.name}-{i}", "title": f.name, "text": ch, "source": f"file://{path}"})
+    st.session_state.index.add_docs(new_docs)
 
-        ok, rails = run_guardrails(question, answer)
-        if not ok:
-            with st.expander("Нарушения (guardrails)", expanded=True):
-                st.error("\n".join(f"• {r}" for r in rails))
-            st.warning("Ответ заблокирован правилами безопасности.")
+if build:
+    st.session_state.index.build()
+    st.success("Индекс обновлён.")
+
+# --- Query ---
+q = st.text_input("Вопрос", placeholder="Например: какие ограничения по санкциям действуют для переводов?")
+use_llm = st.toggle("Собрать финальный ответ LLM (иначе покажем пассажа)", value=True)
+
+def call_llm(messages):
+    prov = GigaChat()
+    return prov.chat(messages, temperature=0.2, max_tokens=800)
+
+def format_citations(passages):
+    lines = []
+    for i,p in enumerate(passages, start=1):
+        lines.append(f"[{i}] {p['title']} — {p['source']}")
+    return "\n".join(lines)
+
+def llm_answer(q, passages):
+    with open(os.path.join(os.path.dirname(__file__), "prompts", "system.txt"), "r", encoding="utf-8") as f:
+        system = f.read()
+    ctx = "\n\n".join([f"Пассаж [{i+1}]: {p['text']}" for i,p in enumerate(passages)])
+    user = f"Вопрос: {q}\n\nИспользуй приведённые пассажа, указывай источники строго по номерам.\n{ctx}\n\nОтветь кратко и по делу."
+    return call_llm([{"role":"system","content":system},{"role":"user","content":user}])
+
+def llm_judge(answer, passages):
+    with open(os.path.join(os.path.dirname(__file__), "prompts", "judge.txt"), "r", encoding="utf-8") as f:
+        judge = f.read()
+    src = "\n".join([f"[{i+1}] {p['text'][:400]}" for i,p in enumerate(passages)])
+    ask = f"{judge}\n\nПассажи:\n{src}\n\nОтвет ассистента:\n{answer}"
+    try:
+        raw = call_llm([{"role":"system","content":"Ты строгий арбитр."},{"role":"user","content":ask}])
+        j = json.loads(raw)
+    except Exception:
+        j = {"ok": False, "needs_fix": True, "violations": ["parse_error"], "critique":"Не удалось распарсить JSON."}
+    return j
+
+def repair_answer(q, passages, critique):
+    prompt = textwrap.dedent(f"""
+    Перепиши ответ строго по правилам:
+    - Ссылайся на пассажа только по номерам в конце (раздел "Источники:").
+    - Ничего не выдумывай вне пассажей.
+    - Избегай PII и нарушений политики.
+    - Если сведений мало — напиши, что данных недостаточно.
+    Вопрос: {q}
+    Пассажи: {" | ".join(str(i+1) for i in range(len(passages)))}
+    """).strip()
+    return call_llm([{"role":"system","content":"Собери безопасный ответ по правилам."},
+                     {"role":"user","content":prompt}])
+
+if st.button("Искать"):
+    if not q.strip():
+        st.warning("Введите вопрос.")
+    else:
+        results = st.session_state.index.search(q, top_k=topk)
+        if not results:
+            st.info("Ничего не найдено.")
         else:
-            st.markdown(answer)
+            if not use_llm:
+                st.subheader("Найденные пассажи")
+                for r in results:
+                    st.markdown(f"**{r['title']}** — _{r['source']}_  \nрейтинґ: `{r['score']:.3f}`  \n\n> {r['text']}")
+            else:
+                answer = llm_answer(q, results)
+                # Guardrails
+                policy = load_policy(os.path.join(os.path.dirname(__file__), "src", "guardrails", "policy.yml"))
+                pii = detect_pii(answer)
+                violations = violates_policy(answer, policy)
+                judge = llm_judge(answer, results)
+                need_fix = bool(pii or violations or judge.get("needs_fix") or not judge.get("ok"))
+                if need_fix:
+                    answer = repair_answer(q, results, judge.get("critique",""))
+                # Добавим источники, если их нет
+                if "Источники" not in answer:
+                    answer += "\n\nИсточники:\n" + format_citations(results)
+                st.markdown("### Ответ")
+                st.write(answer)
+                st.caption("Guardrails: PII=%s, policy=%s, judge=%s" % (",".join(pii) or "-", ",".join(violations) or "-", json.dumps(judge)))
+                # History
+                st.session_state.history.append({"q":q, "answer":answer, "citations":format_citations(results)})
+                # Показать пассажа
+                with st.expander("Показать использованные пассажа"):
+                    for r in results:
+                        st.markdown(f"**{r['title']}** — _{r['source']}_  \nрейтинґ: `{r['score']:.3f}`  \n\n> {r['text']}")
 
-        # Log
-        row = {
-            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "question": question,
-            "top_k": top_k,
-            "use_llm": use_llm,
-            "ok": ok,
-            "violations": "; ".join(rails) if rails else "",
-            "doc_ids": "; ".join([f"file://{corpus[i]['path']}" for _, i in docs]) if docs else ""
-        }
-        st.session_state.setdefault("log_rows", []).append(row)
+# Export
+if export:
+    lines = ["# Отчёт Compliance Bot Pro\n"]
+    for i,item in enumerate(st.session_state.history or []):
+        lines += [f"## Запрос #{i+1}", f"**Вопрос:** {item['q']}", "", "**Ответ:**", item['answer'], "", "**Источники:**", item['citations'], "\n---\n"]
+    md = "\n".join(lines) if lines else "# Пусто"
+    st.download_button("Скачать отчёт.md", md, file_name="report.md")

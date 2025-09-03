@@ -1,0 +1,7 @@
+forbidden_phrases:
+  - "обойти kyc"
+  - "обойти aml"
+  - "обойти санкции"
+  - "как скрыть доходы"
+  - "фальшивые документы"
+require_citations: true
