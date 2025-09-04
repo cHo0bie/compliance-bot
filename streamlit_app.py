@@ -2,6 +2,25 @@
 import os, io, json, textwrap
 import streamlit as st
 
+# --- PII masking helper
+import re
+def mask_sensitive(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    def _mask_digits(m):
+        raw = re.sub(r'\D', '', m.group(0))
+        if len(raw) < 8:
+            return m.group(0)
+        head, tail = raw[:4], raw[-4:]
+        mid = '*' * (len(raw) - 8)
+        masked = head + mid + tail
+        grouped = ' '.join([masked[i:i+4] for i in range(0, len(masked), 4)])
+        return grouped
+    text = re.sub(r'(?<!\d)(?:\d[ -]?){12,24}\d(?!\d)', _mask_digits, text)
+    text = re.sub(r'\b(?:PIN|ПИН|CVV|CVC|OTP|одноразовый\s+код)[:\s]*\d{3,6}\b', '[REDACTED]', text, flags=re.I)
+    return text
+
+
 from src.providers.gigachat import GigaChat
 from src.rag.hybrid import HybridIndex, read_text_from_file, chunk_text
 from src.guardrails.rules import detect_pii, load_policy, violates_policy
